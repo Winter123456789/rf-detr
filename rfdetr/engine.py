@@ -20,6 +20,7 @@ Train and eval functions used in main.py
 import math
 import sys
 from typing import Iterable
+from pathlib import Path
 import random
 
 import torch
@@ -38,6 +39,108 @@ except ImportError:
 from typing import DefaultDict, List, Callable
 from rfdetr.util.misc import NestedTensor
 import numpy as np
+
+from PIL import Image, ImageDraw
+
+DEBUG_EPOCHS = 1
+DEBUG_MAX_PER_SPLIT = 10
+_debug_saved_train = 0
+_debug_saved_val = 0
+
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+_IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+def _to_pil_denorm(tCHW: torch.Tensor) -> Image.Image:
+    """
+    tCHW: float tensor in [0,1] after denorm (we do denorm here), shape (3,H,W), on CPU.
+    Returns PIL.Image in RGB.
+    """
+    # denormalize from ImageNet stats (input was normalized earlier)
+    x = (tCHW * _IMAGENET_STD + _IMAGENET_MEAN).clamp(0, 1)
+    x = (x * 255.0).round().byte().permute(1, 2, 0).numpy() 
+    return Image.fromarray(x, mode="RGB")
+
+def _boxes_to_xyxy_pix(boxes: torch.Tensor, W: int, H: int) -> np.ndarray:
+    if boxes.numel() == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    b = boxes.detach().cpu().float()
+    if float(b.max()) <= 1.5:
+        cx, cy, w, h = b[:, 0] * W, b[:, 1] * H, b[:, 2] * W, b[:, 3] * H
+        x1 = cx - 0.5 * w
+        y1 = cy - 0.5 * h
+        x2 = cx + 0.5 * w
+        y2 = cy + 0.5 * h
+        xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
+    else:
+        xyxy = b
+
+    xyxy[:, 0::2] = xyxy[:, 0::2].clamp(0, W - 1)
+    xyxy[:, 1::2] = xyxy[:, 1::2].clamp(0, H - 1)
+    return xyxy.numpy()
+
+
+def _dump_debug_batch(samples, targets, out_dir: str, epoch: int, step: int, split: str = "train"):
+    """
+    Save up to 'keep' images from the given batch with green rectangles.
+    """
+    outp = Path(out_dir) / "debug" / split
+    outp.mkdir(parents=True, exist_ok=True)
+
+    if hasattr(samples, "tensors"):
+        imgs = samples.tensors.detach().cpu()  # (B,3,H,W), still normalized
+        B, C, H, W = imgs.shape
+        masks = getattr(samples, "mask", None)
+    else:
+        # Fallback if samples is a plain tensor
+        imgs = samples.detach().cpu()
+        B, C, H, W = imgs.shape
+        masks = None
+
+    for i in range(len(targets)):
+        pil = _to_pil_denorm(imgs[i])  # PIL image after denorm
+        draw = ImageDraw.Draw(pil)
+        xyxy = _boxes_to_xyxy_pix(targets[i]["boxes"], W, H)
+
+        # draw green rectangles
+        for (x1, y1, x2, y2) in xyxy:
+            draw.rectangle([float(x1), float(y1), float(x2), float(y2)], outline=(0, 255, 0), width=3)
+
+        # filename: split_e{epoch}_s{step}_i{index}.jpg
+        fname = outp / f"{split}_e{epoch:02d}_s{step:04d}_i{i:02d}.jpg"
+        pil.save(fname)
+
+def _maybe_dump_debug(split: str, samples, targets, epoch: int, step: int, out_dir: str):
+    """Save post-transform images with green boxes during first epoch."""
+    if not utils.is_main_process():
+        return
+    if epoch >= DEBUG_EPOCHS:
+        return
+    global _debug_saved_train, _debug_saved_val
+    saved = _debug_saved_train if split == "train" else _debug_saved_val
+    keep = min(DEBUG_MAX_PER_SPLIT - saved, len(targets))
+    if keep <= 0:
+        return
+
+    # shallow slice to avoid copying full batch
+    if hasattr(samples, "tensors"):
+        samples_s = type(samples)(
+            samples.tensors[:keep],
+            samples.mask[:keep] if hasattr(samples, "mask") and samples.mask is not None else None
+        )
+    else:
+        samples_s = samples[:keep]
+    targets_s = targets[:keep]
+
+    try:
+        _dump_debug_batch(samples_s, targets_s, out_dir, epoch, step, split=split)
+        if split == "train":
+            _debug_saved_train += keep
+        else:
+            _debug_saved_val += keep
+    except Exception as e:
+        print(f"[debug] failed to dump ({split}) batch {step}: {e}")
+
 
 def get_autocast_args(args):
     if DEPRECATED_AMP:
@@ -88,6 +191,11 @@ def train_one_epoch(
     for data_iter_step, (samples, targets) in enumerate(
         metric_logger.log_every(data_loader, print_freq, header)
     ):
+        _maybe_dump_debug("train", samples, targets, epoch, data_iter_step, out_dir=args.output_dir)
+
+        th, tw = samples.tensors.shape[-2], samples.tensors.shape[-1]
+        print(f"[shape-check][train][step {data_iter_step}] tensors HxW = {th}x{tw}")
+
         it = start_steps + data_iter_step
         callback_dict = {
             "step": it,

@@ -19,6 +19,7 @@ Transforms and data augmentation for both image + bbox.
 import random
 
 import PIL
+from PIL import ImageOps
 import numpy as np
 try:
     from collections.abc import Sequence
@@ -477,3 +478,176 @@ class Compose(object):
             format_string += "    {0}".format(t)
         format_string += "\n)"
         return format_string
+
+
+import numpy as np
+from PIL import Image
+try:
+    import albumentations as A
+    _HAS_ALBU = True
+except Exception:
+    _HAS_ALBU = False
+# --------------------------------------
+
+
+class AlbumentationsAdapter:
+    
+    def __init__(self, ops, bbox_params=None):
+        if not _HAS_ALBU:
+            raise RuntimeError("Albumentations not installed but AlbumentationsAdapter was constructed.")
+
+        transforms = []
+        for spec in ops:
+            name = spec.get("op")
+            if name is None:
+                raise ValueError(f"Albumentations op missing 'op' key: {spec}")
+            if name == "Mosaic":
+                # Mosaic should be done before this adapter
+                continue
+            kwargs = {k: v for k, v in spec.items() if k != "op"}
+            if not hasattr(A, name):
+                raise ValueError(f"Unknown Albumentations transform '{name}'")
+            transforms.append(getattr(A, name)(**kwargs))
+
+        if bbox_params is None:
+            bbox_params = {"format": "pascal_voc", "min_visibility": 0.0, "clip": True}
+
+        self.compose = A.Compose(
+            transforms,
+            bbox_params=A.BboxParams(
+                format=bbox_params.get("format", "pascal_voc"),
+                label_fields=["category_ids"],
+                min_visibility=bbox_params.get("min_visibility", 0.0),
+                clip=bbox_params.get("clip", True),
+            )
+        )
+
+    def __call__(self, image, target):
+        image_np = np.array(image)
+
+        if isinstance(target["boxes"], torch.Tensor):
+            bboxes = target["boxes"].cpu().numpy()
+        else:
+            bboxes = np.asarray(target["boxes"], dtype=np.float32)
+
+        if isinstance(target["labels"], torch.Tensor):
+            labels = target["labels"].cpu().tolist()
+        else:
+            labels = list(target["labels"])
+
+        # masks (optioneel)
+        masks = None
+        if "masks" in target and target["masks"] is not None:
+            tm = target["masks"]
+            if isinstance(tm, torch.Tensor):
+                tm = tm.detach().cpu().numpy().astype(np.uint8)
+            if tm.ndim == 3:
+                masks = [tm[i] for i in range(tm.shape[0])]
+            elif tm.ndim == 2:
+                masks = [tm]
+            else:
+                masks = None
+
+        out = self.compose(
+            image=image_np,
+            bboxes=bboxes.tolist(),
+            category_ids=labels,
+            **({"masks": masks} if masks is not None else {})
+        )
+
+        img_out = Image.fromarray(out["image"])
+        tgt_out = target.copy()
+        
+        bxs = out.get("bboxes", [])
+        if len(bxs) == 0:
+            boxes_t = torch.zeros((0, 4), dtype=torch.float32)
+            labels_t = torch.zeros((0,), dtype=torch.long)
+        else:
+            boxes_t = torch.as_tensor(bxs, dtype=torch.float32).view(-1, 4)
+            labels_t = torch.as_tensor(out.get("category_ids", []), dtype=torch.long).view(-1)
+    
+        tgt_out["boxes"] = boxes_t
+        tgt_out["labels"] = labels_t
+
+        if masks is not None and "masks" in out:
+            om = out["masks"]
+            if len(om) > 0:
+                om = np.stack(om, axis=0).astype(np.uint8)
+                tgt_out["masks"] = torch.from_numpy(om > 0)
+            else:
+                tgt_out["masks"] = torch.zeros((0, img_out.size[1], img_out.size[0]), dtype=torch.bool)
+
+        return img_out, tgt_out
+
+
+def build_albumentations_from_config(cfg, split="train"):
+    if not _HAS_ALBU:
+        return []
+
+    block = cfg.get(split, {})
+    ops = block.get("ops", [])
+    if not ops:
+        return []
+
+    bbox_params = block.get("bbox_params", None)
+    return [AlbumentationsAdapter(ops, bbox_params=bbox_params)]
+
+
+class ComposeAugmentations:
+    def __init__(self, transforms):
+        self.transforms = list(transforms or [])
+
+    def __call__(self, image, target):
+        for t in self.transforms:
+            image, target = t(image, target)
+        return image, target
+
+
+class RectResize:
+    """
+    Resize + letterbox to (target_h, target_w) without distortion of the aspect ratio.
+    """
+    def __init__(self, target_size, pad_value=0):
+        # target_size: (H, W)
+        self.target_h = int(target_size[0])
+        self.target_w = int(target_size[1])
+        self.pad_value = pad_value
+
+    def __call__(self, image, target):
+        w, h = image.size  # PIL: (W, H)
+        scale = min(self.target_w / w, self.target_h / h)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+
+        resized = F.resize(image, (new_h, new_w)) 
+
+        pad_w = self.target_w - new_w
+        pad_h = self.target_h - new_h
+        left = pad_w // 2
+        top = pad_h // 2
+        right = pad_w - left
+        bottom = pad_h - top
+        padded = ImageOps.expand(resized, border=(left, top, right, bottom), fill=self.pad_value)
+
+        boxes = target.get("boxes", None)
+        if boxes is not None:
+            if not isinstance(boxes, torch.Tensor):
+                boxes = torch.as_tensor(boxes, dtype=torch.float32)
+            boxes = boxes * torch.tensor([scale, scale, scale, scale], dtype=torch.float32)
+            shift = torch.tensor([left, top, left, top], dtype=torch.float32)
+            boxes = boxes + shift
+            boxes[:, 0::2].clamp_(min=0, max=self.target_w)
+            boxes[:, 1::2].clamp_(min=0, max=self.target_h)
+            target["boxes"] = boxes
+
+        if "masks" in target and target["masks"] is not None and target["masks"].numel() > 0:
+            m = target["masks"].float().unsqueeze(1)   # [N,1,H,W]
+            m = interpolate(m, size=(new_h, new_w), mode="nearest").squeeze(1)  # util.misc.interpolate
+            out = torch.zeros((m.shape[0], self.target_h, self.target_w), dtype=m.dtype)
+            out[:, top:top+new_h, left:left+new_w] = m
+            target["masks"] = out.bool()
+
+        target["size"] = torch.as_tensor([self.target_h, self.target_w])
+        target["orig_size"] = torch.as_tensor([self.target_h, self.target_w])
+
+        return padded, target
