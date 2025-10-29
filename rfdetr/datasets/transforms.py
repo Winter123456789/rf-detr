@@ -648,6 +648,6 @@ class RectResize:
             target["masks"] = out.bool()
 
         target["size"] = torch.as_tensor([self.target_h, self.target_w])
-        target["orig_size"] = torch.as_tensor([self.target_h, self.target_w])
-
+        #target["orig_size"] = torch.as_tensor([self.target_h, self.target_w])
+        
         return padded, target

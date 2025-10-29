@@ -197,7 +197,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
 
             
             target['size'] = torch.tensor([S_h, S_w])
-            target['orig_size'] = torch.tensor([S_h, S_w])
+            #target['orig_size'] = torch.tensor([S_h, S_w])
         
         if self._transforms is not None:
             img, target = self._transforms(img, target)

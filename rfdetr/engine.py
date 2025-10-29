@@ -194,7 +194,7 @@ def train_one_epoch(
         _maybe_dump_debug("train", samples, targets, epoch, data_iter_step, out_dir=args.output_dir)
 
         th, tw = samples.tensors.shape[-2], samples.tensors.shape[-1]
-        print(f"[shape-check][train][step {data_iter_step}] tensors HxW = {th}x{tw}")
+        #print(f"[shape-check][train][step {data_iter_step}] tensors HxW = {th}x{tw}")
 
         it = start_steps + data_iter_step
         callback_dict = {
