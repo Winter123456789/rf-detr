@@ -27,8 +27,20 @@ import pycocotools.mask as coco_mask
 
 import rfdetr.datasets.transforms as T
 
+def _as_int_resolution(resolution):
+    """
+    Normalize resolution to integer
+    - int -> unchanged
+    - (H, W) / [H, W] -> largest side
+    """
+    if isinstance(resolution, (list, tuple)):
+        if len(resolution) != 2:
+            raise ValueError(f"resolution must be int or (H, W); got {resolution}")
+        return int(max(int(resolution[0]), int(resolution[1])))
+    return int(resolution)
 
 def compute_multi_scale_scales(resolution, expanded_scales=False, patch_size=16, num_windows=4):
+    resolution = _as_int_resolution(resolution)
     # round to the nearest multiple of 4*patch_size to enable both patching and windowing
     base_num_patches_per_window = resolution // (patch_size * num_windows)
     offsets = [-3, -2, -1, 0, 1, 2, 3, 4] if not expanded_scales else [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]
@@ -147,10 +159,10 @@ def make_coco_transforms(image_set, resolution, multi_scale=False, expanded_scal
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    scales = [resolution]
+    scales = [_as_int_resolution(resolution)]
     if multi_scale:
         # scales = [448, 512, 576, 640, 704, 768, 832, 896]
-        scales = compute_multi_scale_scales(resolution, expanded_scales, patch_size, num_windows)
+        scales = compute_multi_scale_scales(_as_int_resolution(resolution), expanded_scales, patch_size, num_windows)
         if skip_random_resize:
             scales = [scales[-1]]
         print(scales)
@@ -171,7 +183,7 @@ def make_coco_transforms(image_set, resolution, multi_scale=False, expanded_scal
 
     if image_set == 'val':
         return T.Compose([
-            T.RandomResize([resolution], max_size=1333),
+            T.RandomResize([_as_ing_resolution(resolution)], max_size=1333),
             normalize,
         ])
     if image_set == 'val_speed':
@@ -192,11 +204,11 @@ def make_coco_transforms_square_div_64(image_set, resolution, multi_scale=False,
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-
-    scales = [resolution]
+    res_int = _as_int_resolution(resolution)
+    scales = [res_int]
     if multi_scale:
         # scales = [448, 512, 576, 640, 704, 768, 832, 896]
-        scales = compute_multi_scale_scales(resolution, expanded_scales, patch_size, num_windows)
+        scales = compute_multi_scale_scales(res_int, expanded_scales, patch_size, num_windows)
         if skip_random_resize:
             scales = [scales[-1]]
         print(scales)
@@ -217,17 +229,17 @@ def make_coco_transforms_square_div_64(image_set, resolution, multi_scale=False,
 
     if image_set == 'val':
         return T.Compose([
-            T.SquareResize([resolution]),
+            T.SquareResize([res_int]),
             normalize,
         ])
     if image_set == 'test':
         return T.Compose([
-            T.SquareResize([resolution]),
+            T.SquareResize([res_int]),
             normalize,
         ])
     if image_set == 'val_speed':
         return T.Compose([
-            T.SquareResize([resolution]),
+            T.SquareResize([res_int]),
             normalize,
         ])
 
