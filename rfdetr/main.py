@@ -79,9 +79,15 @@ class Model:
     def __init__(self, **kwargs):
         args = populate_args(**kwargs)
         self.args = args
-        self.resolution = args.resolution
         self.model = build_model(args)
         self.device = torch.device(args.device)
+        if isinstance(args.resolution, int):
+            self.resolution = (args.resolution, args.resolution)
+        elif isinstance(args.resolution, (list, tuple)) and len(args.resolution) == 2:
+            self.resolution = (int(args.resolution[0]), int(args.resolution[1]))
+        else:
+            raise ValueError("Resolution must be an int or a 2-tuple/list (H, W)")
+        args.resolution = self.resolution
         if args.pretrain_weights is not None:
             print("Loading pretrain weights")
             try:

@@ -5,8 +5,8 @@
 # ------------------------------------------------------------------------
 
 
-from pydantic import BaseModel
-from typing import List, Optional, Literal, Type
+from pydantic import BaseModel, validator
+from typing import List, Optional, Literal, Type, Union, Tuple
 import torch
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
@@ -29,7 +29,7 @@ class ModelConfig(BaseModel):
     num_classes: int = 90
     pretrain_weights: Optional[str] = None
     device: Literal["cpu", "cuda", "mps"] = DEVICE
-    resolution: int
+    resolution: Union[int, Tuple[int, int]] = 560
     group_detr: int = 13
     gradient_checkpointing: bool = False
     positional_encoding_size: int
@@ -37,6 +37,19 @@ class ModelConfig(BaseModel):
     cls_loss_coef: float = 1.0
     segmentation_head: bool = False
     mask_downsample_ratio: int = 4
+    
+    @validator("resolution", pre=True)
+    def _normalize_resolution(cls, v):
+        # int -> (n, n); tuple/list -> (H, W)
+        if isinstance(v, int):
+            return (v, v)
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            h, w = int(v[0]), int(v[1])
+            if h <= 0 or w <= 0:
+                raise ValueError("resolution must be positive")
+            return (h, w)
+        raise ValueError("resolution must be an int or a 2-tuple/list (H, W)")
+    
 
 
 class RFDETRBaseConfig(ModelConfig):
@@ -56,7 +69,7 @@ class RFDETRBaseConfig(ModelConfig):
     projector_scale: List[Literal["P3", "P4", "P5"]] = ["P4"]
     out_feature_indexes: List[int] = [2, 5, 8, 11]
     pretrain_weights: Optional[str] = "rf-detr-base.pth"
-    resolution: int = 560
+    resolution: Union[int, Tuple[int, int]] = 560
     positional_encoding_size: int = 37
 
 class RFDETRLargeConfig(RFDETRBaseConfig):
@@ -70,6 +83,7 @@ class RFDETRLargeConfig(RFDETRBaseConfig):
     dec_n_points: int = 4
     projector_scale: List[Literal["P3", "P4", "P5"]] = ["P3", "P5"]
     pretrain_weights: Optional[str] = "rf-detr-large.pth"
+    
 
 class RFDETRNanoConfig(RFDETRBaseConfig):
     """
@@ -79,7 +93,7 @@ class RFDETRNanoConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 2
     patch_size: int = 16
-    resolution: int = 384
+    resolution: Union[int, Tuple[int, int]] = 384
     positional_encoding_size: int = 24
     pretrain_weights: Optional[str] = "rf-detr-nano.pth"
 
@@ -91,7 +105,7 @@ class RFDETRSmallConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 3
     patch_size: int = 16
-    resolution: int = 512
+    resolution: Union[int, Tuple[int, int]] = 512
     positional_encoding_size: int = 32
     pretrain_weights: Optional[str] = "rf-detr-small.pth"
 
@@ -103,7 +117,7 @@ class RFDETRMediumConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 4
     patch_size: int = 16
-    resolution: int = 576
+    resolution: Union[int, Tuple[int, int]] = 576
     positional_encoding_size: int = 36
     pretrain_weights: Optional[str] = "rf-detr-medium.pth"
 

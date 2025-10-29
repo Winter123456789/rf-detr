@@ -794,7 +794,7 @@ def build_model(args):
         position_embedding=args.position_embedding,
         freeze_encoder=args.freeze_encoder,
         layer_norm=args.layer_norm,
-        target_shape=args.shape if hasattr(args, 'shape') else (args.resolution, args.resolution) if hasattr(args, 'resolution') else (640, 640),
+        target_shape=args.shape if hasattr(args, 'shape') else getattr(args, "resolution", (640, 640)),
         rms_norm=args.rms_norm,
         backbone_lora=args.backbone_lora,
         force_no_pretrain=args.force_no_pretrain,

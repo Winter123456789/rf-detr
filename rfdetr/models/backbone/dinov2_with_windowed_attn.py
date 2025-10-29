@@ -244,23 +244,34 @@ class WindowedDinov2WithRegistersEmbeddings(nn.Module):
         num_patches = embeddings.shape[1] - 1
         num_positions = self.position_embeddings.shape[1] - 1
 
+        # runtime grid
+        ph, pw = self.patch_embeddings.patch_size
+        H_new = int(height // ph)
+        W_new = int(width  // pw)
+                
         # Skip interpolation for matching dimensions (unless tracing)
-        if not torch.jit.is_tracing() and num_patches == num_positions and height == width:
+        if not torch.jit.is_tracing() and num_patches == num_positions:
             return self.position_embeddings
-
+                        
         # Handle class token and patch embeddings separately
-        class_pos_embed = self.position_embeddings[:, 0]
-        patch_pos_embed = self.position_embeddings[:, 1:]
-        dim = embeddings.shape[-1]
+        class_pos_embed = self.position_embeddings[:, 0:1] # (1, 1, dim)
+        patch_pos_embed = self.position_embeddings[:, 1:]  # (1, N, dim)
+        dim = patch_pos_embed.shape[-1]
 
-        # Calculate new dimensions
-        height = height // self.config.patch_size
-        width = width // self.config.patch_size
+        # Original training grid from config (image size / patch_size)
+        img_h, img_w = self.patch_embeddings.image_size
+        H_cfg = int(H_new)
+        W_cfg = int(W_new)
 
-        # Reshape for interpolation
-        sqrt_num_positions = torch_int(num_positions**0.5)
-        patch_pos_embed = patch_pos_embed.reshape(1, sqrt_num_positions, sqrt_num_positions, dim)
-        patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
+        if (H_new * W_new) == int(num_positions):
+            H_orig, W_orig = H_new, W_new
+        else:
+            # Fallback to sqrt heuristic, shapes don't match
+            sqrt_num_positions = torch_int(num_positions ** 0.5)
+            H_orig, W_orig = int(sqrt_num_positions), int(sqrt_num_positions)
+
+        # (1, H_orig, W_orig, dim) -> (1, dim, H_orig, W_orig)
+        patch_pos_embed = patch_pos_embed.reshape(1, H_orig, W_orig, dim).permute(0, 3, 1, 2)
 
         # Store original dtype for restoration after interpolation
         target_dtype = patch_pos_embed.dtype
@@ -268,22 +279,13 @@ class WindowedDinov2WithRegistersEmbeddings(nn.Module):
         # Interpolate at float32 precision
         patch_pos_embed = nn.functional.interpolate(
             patch_pos_embed.to(dtype=torch.float32),
-            size=(torch_int(height), torch_int(width)),  # Explicit size instead of scale_factor
+            size=(H_new, W_new),
             mode="bicubic",
             align_corners=False,
             antialias=True,
         ).to(dtype=target_dtype)
-
-        # Validate output dimensions if not tracing
-        if not torch.jit.is_tracing():
-            if int(height) != patch_pos_embed.shape[-2] or int(width) != patch_pos_embed.shape[-1]:
-                raise ValueError("Width or height does not match with the interpolated position embeddings")
-
-        # Reshape back to original format
-        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-
-        # Combine class and patch embeddings
-        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).reshape(1, H_new * W_new, dim)
+        return torch.cat((class_pos_embed, patch_pos_embed), dim=1)
 
     def forward(self, pixel_values: torch.Tensor, bool_masked_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
         batch_size, _, height, width = pixel_values.shape
@@ -303,16 +305,20 @@ class WindowedDinov2WithRegistersEmbeddings(nn.Module):
         embeddings = embeddings + self.interpolate_pos_encoding(embeddings, height, width)
 
         if self.config.num_windows > 1:
-            # reshape for windows
-            num_h_patches = height // self.config.patch_size
-            num_w_patches = width // self.config.patch_size
+            # reshape for windows (support tuple patch size)
+            ph, pw = self.patch_embeddings.patch_size
+            num_h_patches = height // ph
+            num_w_patches = width // pw
+            assert num_h_patches % self.config.num_windows == 0, f"h-patches {num_h_patches} not divisible by num_windows={self.config.num_windows}"
+            assert num_w_patches % self.config.num_windows == 0, f"w-patches {num_w_patches} not divisible by num_windows={self.config.num_windows}"
+            
             cls_token_with_pos_embed = embeddings[:, :1]
             pixel_tokens_with_pos_embed = embeddings[:, 1:]
             pixel_tokens_with_pos_embed = pixel_tokens_with_pos_embed.view(batch_size, num_h_patches, num_w_patches, -1)
             num_w_patches_per_window = num_w_patches // self.config.num_windows
             num_h_patches_per_window = num_h_patches // self.config.num_windows
             num_windows = self.config.num_windows
-            windowed_pixel_tokens = pixel_tokens_with_pos_embed.reshape(batch_size * num_windows, num_h_patches_per_window, num_windows, num_h_patches_per_window, -1)
+            windowed_pixel_tokens = pixel_tokens_with_pos_embed.reshape(batch_size * num_windows, num_h_patches_per_window, num_windows, num_w_patches_per_window, -1)
             windowed_pixel_tokens = windowed_pixel_tokens.permute(0, 2, 1, 3, 4)
             windowed_pixel_tokens = windowed_pixel_tokens.reshape(batch_size * num_windows ** 2, num_h_patches_per_window * num_w_patches_per_window, -1)
             windowed_cls_token_with_pos_embed = cls_token_with_pos_embed.repeat(num_windows ** 2, 1, 1)
@@ -1088,10 +1094,12 @@ class WindowedDinov2WithRegistersBackbone(WindowedDinov2WithRegistersPreTrainedM
                     # this was actually a bug in the original implementation that we copied here,
                     # cause normally the order is height, width
                     batch_size, _, height, width = pixel_values.shape
-                    patch_size = self.config.patch_size
-
-                    num_h_patches = height // patch_size
-                    num_w_patches = width // patch_size
+                    if isinstance(self.config.patch_size, collections.abc.Iterable):
+                        ph, pw = self.config.patch_size
+                    else:
+                        ph = pw = self.config.patch_size
+                    num_h_patches = height // ph
+                    num_w_patches = width // pw
                     
                     if self.config.num_windows > 1:
                         # undo windowing

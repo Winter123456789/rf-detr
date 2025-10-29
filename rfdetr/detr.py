@@ -89,7 +89,7 @@ class RFDETR:
         self.model.inference_model.eval()
         self.model.inference_model.export()
 
-        self._optimized_resolution = self.model.resolution
+        self._optimized_resolution = tuple(self.model.resolution)
         self._is_optimized_for_inference = True
 
         self.model.inference_model = self.model.inference_model.to(dtype=dtype)
@@ -99,7 +99,7 @@ class RFDETR:
             self.model.inference_model = torch.jit.trace(
                 self.model.inference_model,
                 torch.randn(
-                    batch_size, 3, self.model.resolution, self.model.resolution, 
+                    batch_size, 3, self.model.resolution[0], self.model.resolution[1], 
                     device=self.model.device,
                     dtype=dtype
                 )
@@ -288,18 +288,18 @@ class RFDETR:
 
             img_tensor = img_tensor.to(self.model.device)
             img_tensor = F.normalize(img_tensor, self.means, self.stds)
-            img_tensor = F.resize(img_tensor, (self.model.resolution, self.model.resolution))
+            img_tensor = F.resize(img_tensor, (self.model.resolution[0], self.model.resolution[1]))
 
             processed_images.append(img_tensor)
 
         batch_tensor = torch.stack(processed_images)
 
         if self._is_optimized_for_inference:
-            if self._optimized_resolution != batch_tensor.shape[2]:
+            if self._optimized_resolution != tuple(batch_tensor.shape[2:4]):
                 # this could happen if someone manually changes self.model.resolution after optimizing the model
                 raise ValueError(f"Resolution mismatch. "
                                  f"Model was optimized for resolution {self._optimized_resolution}, "
-                                 f"but got {batch_tensor.shape[2]}. "
+                                 f"but got {tuple(batch_tensor.shape[2:4])}. "
                                  "You can explicitly remove the optimized model by calling model.remove_optimized_model().")
             if self._optimized_has_been_compiled:
                 if self._optimized_batch_size != batch_tensor.shape[0]:
